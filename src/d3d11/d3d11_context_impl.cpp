@@ -1902,8 +1902,21 @@ public:
     if (next == active_context_state_.ptr())
       return;
 
-    // end the current pass while state_ still describes it
-    ResetEncodingContextState();
+    // Direct2D swaps around every primitive it draws, often onto the render targets that are already bound.
+    // Ending the render pass each time is expensive on tile-based GPUs, so keep it when the targets match.
+    bool keep_pass = SameOutputTargets(state_.OutputMerger, next->state.OutputMerger);
+    if (keep_pass) {
+      EmitST([](ArgumentEncodingContext &enc) { enc.clearState(); });
+      InvalidateRenderPipeline();
+      InvalidateComputePipeline();
+      dirty_state.set(
+          DirtyState::BlendFactorAndStencilRef, DirtyState::RasterizerState, DirtyState::DepthStencilState,
+          DirtyState::Viewport, DirtyState::Scissors
+      );
+    } else {
+      // end the current pass while state_ still describes it
+      ResetEncodingContextState();
+    }
 
     // binding sets are move-only; moving marks every bound slot dirty, and pipeline state is rebuilt on the next
     // draw/dispatch. the incoming object's copy is left stale while it is active (see MTLD3D11DeviceContextState)
@@ -4617,6 +4630,25 @@ public:
     });
 
     cmdbuf_state = CommandBufferState::ComputeEncoderActive;
+  }
+
+  static bool
+  SameOutputTargets(const D3D11OutputMergerStageState &a, const D3D11OutputMergerStageState &b) {
+    // compare what the views point at: Direct2D creates its own views of the app's textures
+    auto same_view = [](auto *x, auto *y) {
+      if (x == y)
+        return true;
+      if (!x || !y)
+        return false;
+      return x->texture().ptr() == y->texture().ptr() && x->viewId() == y->viewId();
+    };
+    if (a.NumRTVs != b.NumRTVs || !same_view(a.DSV.ptr(), b.DSV.ptr()))
+      return false;
+    for (unsigned i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+      if (!same_view(a.RTVs[i].ptr(), b.RTVs[i].ptr()))
+        return false;
+    // UAVs bound to the output merger are part of the pass; don't try to be clever with them
+    return !a.UAVs.any_bound() && !b.UAVs.any_bound();
   }
 
   template <PipelineStage Type>
