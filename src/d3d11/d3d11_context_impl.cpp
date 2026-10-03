@@ -41,6 +41,11 @@
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
+#include "util_env.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <unordered_map>
 
 namespace dxmt {
 
@@ -1280,6 +1285,7 @@ public:
     DrawCallStatus status = PreDraw<false>();
     if (status == DrawCallStatus::Invalid)
       return;
+    RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', VertexCount);
     if (status == DrawCallStatus::Geometry) {
       return GeometryDraw(VertexCount, 1, StartVertexLocation, 0);
     }
@@ -1313,6 +1319,7 @@ public:
     DrawCallStatus status = PreDraw<true>();
     if (status == DrawCallStatus::Invalid)
       return;
+    RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', IndexCount);
     if (status == DrawCallStatus::Geometry) {
       return GeometryDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation, 1, 0);
     }
@@ -1356,6 +1363,7 @@ public:
     DrawCallStatus status = PreDraw<false>();
     if (status == DrawCallStatus::Invalid)
       return;
+    RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', uint64_t(VertexCountPerInstance) * InstanceCount);
     if (status == DrawCallStatus::Geometry) {
       return GeometryDraw(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
     }
@@ -1395,6 +1403,7 @@ public:
     DrawCallStatus status = PreDraw<true>();
     if (status == DrawCallStatus::Invalid)
       return;
+    RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', uint64_t(IndexCountPerInstance) * InstanceCount);
     if (status == DrawCallStatus::Geometry) {
       return GeometryDrawIndexed(
           IndexCountPerInstance, StartIndexLocation, BaseVertexLocation, InstanceCount, StartInstanceLocation
@@ -1595,6 +1604,7 @@ public:
     DrawCallStatus status = PreDraw<true>();
     if (status == DrawCallStatus::Invalid)
       return;
+    RecordDraw('I', 0); // indirect: counts live in a GPU buffer
     if (status == DrawCallStatus::Geometry) {
       return GeometryDrawIndexedIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
     }
@@ -1637,6 +1647,7 @@ public:
     DrawCallStatus status = PreDraw<false>();
     if (status == DrawCallStatus::Invalid)
       return;
+    RecordDraw('I', 0); // indirect: counts live in a GPU buffer
     if (status == DrawCallStatus::Geometry) {
       return GeometryDrawIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
     }
@@ -1902,9 +1913,10 @@ public:
     if (next == active_context_state_.ptr())
       return;
 
+    draw_stats_swaps_++;
     // Direct2D swaps around every primitive it draws, often onto the render targets that are already bound.
     // Ending the render pass each time is expensive on tile-based GPUs, so keep it when the targets match.
-    bool keep_pass = SameOutputTargets(state_.OutputMerger, next->state.OutputMerger);
+    bool keep_pass = LiveFlag("swap_keep_pass", true) && SameOutputTargets(state_.OutputMerger, next->state.OutputMerger);
     if (keep_pass) {
       EmitST([](ArgumentEncodingContext &enc) { enc.clearState(); });
       InvalidateRenderPipeline();
@@ -4338,6 +4350,7 @@ public:
         enc.endPass();
       });
       allocated_encoder_argbuf_size_ = nullptr;
+      draw_stats_pass_ends_++;
       break;
     }
     case CommandBufferState::ComputeEncoderActive:
@@ -4649,6 +4662,124 @@ public:
         return false;
     // UAVs bound to the output merger are part of the pass; don't try to be clever with them
     return !a.UAVs.any_bound() && !b.UAVs.any_bound();
+  }
+
+  // Diagnostics: DXMT_LIVE_FLAGS=<windows path> to a file of "name=0|1" lines, re-read every ~2s on present,
+  // so optimizations can be A/B tested without restarting the game.
+  bool
+  LiveFlag(const char *name, bool default_value) {
+    auto it = live_flags_.find(name);
+    return it == live_flags_.end() ? default_value : it->second;
+  }
+
+  void
+  ReloadLiveFlags() {
+    auto path = env::getEnvVar("DXMT_LIVE_FLAGS");
+    if (path.empty())
+      return;
+    auto now = std::chrono::steady_clock::now();
+    if (now - live_flags_last_ < std::chrono::seconds(2))
+      return;
+    live_flags_last_ = now;
+    std::FILE *f = std::fopen(path.c_str(), "r");
+    if (!f)
+      return;
+    std::unordered_map<std::string, bool> flags;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+      std::string l(line);
+      auto eq = l.find('=');
+      if (eq == std::string::npos)
+        continue;
+      auto key = l.substr(0, eq);
+      key.erase(key.find_last_not_of(" \t") + 1);
+      flags[key] = l[eq + 1 + l.substr(eq + 1).find_first_not_of(" \t")] == '1';
+    }
+    std::fclose(f);
+    if (flags != live_flags_ && DrawStatsEnabled()) {
+      std::fprintf(draw_stats_file_, "--- live flags changed:");
+      for (auto &[k, v] : flags)
+        std::fprintf(draw_stats_file_, " %s=%d", k.c_str(), v);
+      std::fprintf(draw_stats_file_, "\n");
+    }
+    live_flags_ = std::move(flags);
+  }
+
+  // Diagnostics: DXMT_DRAW_STATS=<windows path> appends per-shader draw volume (averaged per frame) every ~5s.
+  struct DrawStatEntry {
+    uint64_t draws = 0;
+    uint64_t elements = 0; // vertices/indices x instances; control points x instances for tessellation
+  };
+
+  bool
+  DrawStatsEnabled() {
+    if (!draw_stats_checked_) {
+      draw_stats_checked_ = true;
+      auto path = env::getEnvVar("DXMT_DRAW_STATS");
+      if (!path.empty())
+        draw_stats_file_ = std::fopen(path.c_str(), "a");
+      draw_stats_last_ = std::chrono::steady_clock::now();
+    }
+    return draw_stats_file_ != nullptr;
+  }
+
+  template <PipelineStage Stage>
+  std::string
+  ShaderTag() {
+    auto shader = GetManagedShader<Stage>();
+    return shader ? shader->sha1().string().substr(0, 16) : std::string("-");
+  }
+
+  void
+  RecordDraw(char kind, uint64_t elements) {
+    if (likely(!DrawStatsEnabled()))
+      return;
+    std::string key(1, kind);
+    key += " vs=" + ShaderTag<PipelineStage::Vertex>();
+    if (kind == 'T')
+      key += " hs=" + ShaderTag<PipelineStage::Hull>() + " ds=" + ShaderTag<PipelineStage::Domain>();
+    if (kind == 'G')
+      key += " gs=" + ShaderTag<PipelineStage::Geometry>();
+    key += " ps=" + ShaderTag<PipelineStage::Pixel>();
+    auto &entry = draw_stats_[key];
+    entry.draws++;
+    entry.elements += elements;
+  }
+
+  void
+  RecordFrameForDrawStats() {
+    ReloadLiveFlags();
+    if (likely(!DrawStatsEnabled()))
+      return;
+    draw_stats_frames_++;
+    auto now = std::chrono::steady_clock::now();
+    if (now - draw_stats_last_ < std::chrono::seconds(5))
+      return;
+    double seconds = std::chrono::duration<double>(now - draw_stats_last_).count();
+    std::vector<std::pair<std::string, DrawStatEntry>> sorted(draw_stats_.begin(), draw_stats_.end());
+    std::sort(sorted.begin(), sorted.end(), [](auto &a, auto &b) { return a.second.elements > b.second.elements; });
+    uint64_t total_draws = 0, total_elements = 0;
+    for (auto &[k, e] : sorted) {
+      total_draws += e.draws;
+      total_elements += e.elements;
+    }
+    double frames = std::max<uint64_t>(draw_stats_frames_, 1);
+    std::fprintf(
+        draw_stats_file_, "=== %.1f fps over %.1fs: %.0f draws/frame, %.0f elements/frame, %.1f render passes/frame, %.1f state swaps/frame\n",
+        draw_stats_frames_ / seconds, seconds, total_draws / frames, total_elements / frames,
+        draw_stats_pass_ends_ / frames, draw_stats_swaps_ / frames
+    );
+    for (size_t i = 0; i < sorted.size() && i < 30; i++)
+      std::fprintf(
+          draw_stats_file_, "%10.0f elem/f %6.1f draws/f  %s\n", sorted[i].second.elements / frames,
+          sorted[i].second.draws / frames, sorted[i].first.c_str()
+      );
+    std::fflush(draw_stats_file_);
+    draw_stats_.clear();
+    draw_stats_frames_ = 0;
+    draw_stats_pass_ends_ = 0;
+    draw_stats_swaps_ = 0;
+    draw_stats_last_ = now;
   }
 
   template <PipelineStage Type>
@@ -5194,6 +5325,15 @@ protected:
   D3D11ContextState state_;
   // private reference: a public one would keep the device alive
   Com<MTLD3D11DeviceContextState, false> active_context_state_;
+  std::unordered_map<std::string, DrawStatEntry> draw_stats_;
+  std::FILE *draw_stats_file_ = nullptr;
+  bool draw_stats_checked_ = false;
+  uint64_t draw_stats_frames_ = 0;
+  std::chrono::steady_clock::time_point draw_stats_last_;
+  uint64_t draw_stats_pass_ends_ = 0;
+  uint64_t draw_stats_swaps_ = 0;
+  std::unordered_map<std::string, bool> live_flags_;
+  std::chrono::steady_clock::time_point live_flags_last_;
   D3D11UserDefinedAnnotation annotation_;
   MTLD3D11ContextExt<ContextInternalState> ext_;
   uint64_t max_object_threadgroups_;

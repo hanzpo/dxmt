@@ -501,6 +501,8 @@ public:
 
   void PrepareFlush() override {
     InvalidateCurrentPass(true);
+    // only called from Present, so it marks frame boundaries
+    RecordFrameForDrawStats();
   }
 
   void
