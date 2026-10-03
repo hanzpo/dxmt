@@ -876,6 +876,8 @@ struct PassLog {
   std::chrono::steady_clock::time_point last;
   std::unordered_map<obj_handle_t, unsigned> ids;
   unsigned pass_index = 0;
+  uint64_t label_frame = ~0ull;
+  unsigned label_index = 0;
 
   bool
   enabled() {
@@ -1077,6 +1079,19 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
       }
       auto gpu_buffer_ = data->allocated_argbuf;
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+      if (unlikely(g_pass_log.enabled())) {
+        // label passes with the same per-frame index the pass dump uses, so GPU traces can be matched to it
+        if (g_pass_log.label_frame != frame_id_) {
+          g_pass_log.label_frame = frame_id_;
+          g_pass_log.label_index = 0;
+        }
+        char label[64];
+        std::snprintf(
+            label, sizeof(label), "P%u %ux%u", g_pass_log.label_index++, data->render_target_width,
+            data->render_target_height
+        );
+        encoder.setLabel(WMT::String::string(label, WMTUTF8StringEncoding));
+      }
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
           [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStagePreRaster); },
