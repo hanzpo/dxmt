@@ -26,6 +26,10 @@
 #include "wsi_platform.hpp"
 #include <cstdint>
 #include <cfloat>
+#include <chrono>
+#include <cstdio>
+#include <unordered_map>
+#include "util_env.hpp"
 
 namespace dxmt {
 
@@ -860,6 +864,82 @@ ArgumentEncodingContext::$$setEncodingContext(uint64_t seq_id, uint64_t frame_id
 
 constexpr unsigned kEncoderOptimizerThreshold = 64;
 
+namespace {
+
+// Diagnostics: DXMT_PASS_LOG=<windows path> dumps every render pass of one frame (after encoder optimization) every
+// ~10s: render target size, attachments with load/store actions, command count.
+struct PassLog {
+  std::FILE *file = nullptr;
+  bool checked = false;
+  uint64_t target_frame = 0;
+  bool dumping = false;
+  std::chrono::steady_clock::time_point last;
+  std::unordered_map<obj_handle_t, unsigned> ids;
+  unsigned pass_index = 0;
+
+  bool
+  enabled() {
+    if (!checked) {
+      checked = true;
+      auto path = env::getEnvVar("DXMT_PASS_LOG");
+      if (!path.empty())
+        file = std::fopen(path.c_str(), "a");
+      last = std::chrono::steady_clock::now();
+    }
+    return file != nullptr;
+  }
+
+  // returns true if passes of this frame should be logged
+  bool
+  beginFlush(uint64_t frame_id) {
+    if (!enabled())
+      return false;
+    if (dumping && frame_id > target_frame) {
+      std::fprintf(file, "--- end of frame %llu: %u render passes\n", (unsigned long long)target_frame, pass_index);
+      std::fflush(file);
+      dumping = false;
+      last = std::chrono::steady_clock::now();
+    }
+    if (!dumping && std::chrono::steady_clock::now() - last > std::chrono::seconds(10)) {
+      dumping = true;
+      target_frame = frame_id + 1; // start at a frame boundary
+      ids.clear();
+      pass_index = 0;
+    }
+    return dumping && frame_id == target_frame;
+  }
+
+  unsigned
+  id(obj_handle_t handle) {
+    return ids.emplace(handle, (unsigned)ids.size() + 1).first->second;
+  }
+};
+
+PassLog g_pass_log;
+
+const char *
+LoadName(WMTLoadAction a) {
+  switch (a) {
+  case WMTLoadActionDontCare: return "dontcare";
+  case WMTLoadActionLoad: return "LOAD";
+  case WMTLoadActionClear: return "clear";
+  }
+  return "?";
+}
+
+const char *
+StoreName(WMTStoreAction a) {
+  switch (a) {
+  case WMTStoreActionDontCare: return "dontcare";
+  case WMTStoreActionStore: return "STORE";
+  case WMTStoreActionMultisampleResolve: return "resolve";
+  case WMTStoreActionStoreAndMultisampleResolve: return "STORE+resolve";
+  default: return "?";
+  }
+}
+
+} // namespace
+
 QueryReadbacks
 ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId, uint64_t event_seq_id) {
   assert(!encoder_current);
@@ -904,9 +984,12 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
   std::erase_if(pending_queries_, [=](auto &query) -> bool { return query->queryEndAt() == seqId; });
 
   readbacks.timestamp = timestamp_state_.flush(cmdbuf);
+  bool log_passes = g_pass_log.beginFlush(frame_id_);
 
   while (encoder_index) {
     auto current = encoders[encoder_count - encoder_index];
+    if (unlikely(log_passes) && current->type != EncoderType::Render && current->type != EncoderType::Null)
+      std::fprintf(g_pass_log.file, "     (encoder type %u)\n", (unsigned)current->type);
     switch (current->type) {
     case EncoderType::Render: {
       auto data = static_cast<RenderEncoderData *>(current);
@@ -956,6 +1039,37 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         render_pass_info.render_target_array_length = data->render_target_array_length;
         render_pass_info.render_target_width = data->render_target_width;
         render_pass_info.render_target_height = data->render_target_height;
+      }
+      if (unlikely(log_passes)) {
+        unsigned cmds = 0;
+        for (auto cmd = (wmtcmd_base *)data->cmd_head.next.get(); cmd; cmd = (wmtcmd_base *)cmd->next.get())
+          cmds++;
+        auto f = g_pass_log.file;
+        std::fprintf(
+            f, "pass %3u %5ux%-5u arr=%u samples=%u cmds=%-5u%s%s |", g_pass_log.pass_index++,
+            data->render_target_width, data->render_target_height, data->render_target_array_length,
+            data->default_raster_sample_count, cmds, data->use_tessellation ? " tess" : "",
+            data->use_geometry ? " gs" : ""
+        );
+        for (unsigned i = 0; i < std::size(render_pass_info.colors); i++) {
+          auto &c = render_pass_info.colors[i];
+          if (!c.texture)
+            continue;
+          std::fprintf(
+              f, " c%u=t%u[%s/%s]", i, g_pass_log.id(c.texture), LoadName(c.load_action), StoreName(c.store_action)
+          );
+        }
+        if (render_pass_info.depth.texture)
+          std::fprintf(
+              f, " d=t%u[%s/%s]", g_pass_log.id(render_pass_info.depth.texture),
+              LoadName(render_pass_info.depth.load_action), StoreName(render_pass_info.depth.store_action)
+          );
+        if (render_pass_info.stencil.texture)
+          std::fprintf(
+              f, " s=t%u[%s/%s]", g_pass_log.id(render_pass_info.stencil.texture),
+              LoadName(render_pass_info.stencil.load_action), StoreName(render_pass_info.stencil.store_action)
+          );
+        std::fprintf(f, "\n");
       }
       if (data->use_visibility_result) {
         assert(readbacks.visibility);
