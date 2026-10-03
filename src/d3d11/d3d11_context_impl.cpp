@@ -46,6 +46,7 @@
 #include <chrono>
 #include <cstdio>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace dxmt {
 
@@ -1285,6 +1286,8 @@ public:
     DrawCallStatus status = PreDraw<false>();
     if (status == DrawCallStatus::Invalid)
       return;
+    if (unlikely(ShouldSkipDraw()))
+      return;
     RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', VertexCount);
     if (status == DrawCallStatus::Geometry) {
       return GeometryDraw(VertexCount, 1, StartVertexLocation, 0);
@@ -1318,6 +1321,8 @@ public:
       return;
     DrawCallStatus status = PreDraw<true>();
     if (status == DrawCallStatus::Invalid)
+      return;
+    if (unlikely(ShouldSkipDraw()))
       return;
     RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', IndexCount);
     if (status == DrawCallStatus::Geometry) {
@@ -1363,6 +1368,8 @@ public:
     DrawCallStatus status = PreDraw<false>();
     if (status == DrawCallStatus::Invalid)
       return;
+    if (unlikely(ShouldSkipDraw()))
+      return;
     RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', uint64_t(VertexCountPerInstance) * InstanceCount);
     if (status == DrawCallStatus::Geometry) {
       return GeometryDraw(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
@@ -1402,6 +1409,8 @@ public:
       return;
     DrawCallStatus status = PreDraw<true>();
     if (status == DrawCallStatus::Invalid)
+      return;
+    if (unlikely(ShouldSkipDraw()))
       return;
     RecordDraw(status == DrawCallStatus::Tessellation ? 'T' : status == DrawCallStatus::Geometry ? 'G' : 'O', uint64_t(IndexCountPerInstance) * InstanceCount);
     if (status == DrawCallStatus::Geometry) {
@@ -1604,6 +1613,8 @@ public:
     DrawCallStatus status = PreDraw<true>();
     if (status == DrawCallStatus::Invalid)
       return;
+    if (unlikely(ShouldSkipDraw()))
+      return;
     RecordDraw('I', 0); // indirect: counts live in a GPU buffer
     if (status == DrawCallStatus::Geometry) {
       return GeometryDrawIndexedIndirect(pBufferForArgs, AlignedByteOffsetForArgs);
@@ -1646,6 +1657,8 @@ public:
       return;
     DrawCallStatus status = PreDraw<false>();
     if (status == DrawCallStatus::Invalid)
+      return;
+    if (unlikely(ShouldSkipDraw()))
       return;
     RecordDraw('I', 0); // indirect: counts live in a GPU buffer
     if (status == DrawCallStatus::Geometry) {
@@ -4702,6 +4715,10 @@ public:
         std::fprintf(draw_stats_file_, " %s=%d", k.c_str(), v);
       std::fprintf(draw_stats_file_, "\n");
     }
+    live_skip_vs_.clear();
+    for (auto &[k, v] : flags)
+      if (v && k.rfind("skip_vs_", 0) == 0)
+        live_skip_vs_.insert(k.substr(8));
     live_flags_ = std::move(flags);
   }
 
@@ -4728,6 +4745,15 @@ public:
   ShaderTag() {
     auto shader = GetManagedShader<Stage>();
     return shader ? shader->sha1().string().substr(0, 16) : std::string("-");
+  }
+
+  // Diagnostics: a live flag "skip_vs_<16 hex digits of the vertex shader sha1>=1" drops matching draws, to measure
+  // what a shader costs by turning it off mid-game.
+  bool
+  ShouldSkipDraw() {
+    if (likely(live_skip_vs_.empty()))
+      return false;
+    return live_skip_vs_.count(ShaderTag<PipelineStage::Vertex>()) != 0;
   }
 
   void
@@ -5334,6 +5360,7 @@ protected:
   uint64_t draw_stats_swaps_ = 0;
   std::unordered_map<std::string, bool> live_flags_;
   std::chrono::steady_clock::time_point live_flags_last_;
+  std::unordered_set<std::string> live_skip_vs_;
   D3D11UserDefinedAnnotation annotation_;
   MTLD3D11ContextExt<ContextInternalState> ext_;
   uint64_t max_object_threadgroups_;
